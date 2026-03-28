@@ -44,17 +44,16 @@ def init_db():
 
 init_db()
 
-# --- Load HTML from external file ---
-try:
-    with open("register.html", "r", encoding="utf-8") as f:
-        HTML_TEMPLATE = f.read()
-except FileNotFoundError:
-    HTML_TEMPLATE = "<h1>Error: register.html not found</h1>"
-
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE)
+    # Load from file every time so you can edit register.html
+    # and just refresh the page to see changes.
+    try:
+        with open("register.html", "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return "<h2>Error: register.html not found</h2>", 404
 
 
 @app.route("/get-options")
@@ -133,4 +132,4 @@ def complete_registration():
 
 
 if __name__ == "__main__":
-    app.run(port=5000)
+    app.run(host="localhost", port=5001)
