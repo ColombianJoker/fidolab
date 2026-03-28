@@ -44,57 +44,12 @@ def init_db():
 
 init_db()
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
-<head><title>FIDO2 Register</title></head>
-<body style="font-family: sans-serif; max-width: 600px; margin: 40px auto;">
-    <h2>FidoLab: Registration</h2>
-    <div>
-        <input type="text" id="username" placeholder="Username" value="ramon_test">
-        <button onclick="register()">Register Feitian Key</button>
-    </div>
-    <pre id="log" style="background: #eee; padding: 10px; margin-top: 20px;"></pre>
-
-    <script>
-        const log = (m) => document.getElementById('log').innerText += m + '\\n';
-
-        async function register() {
-            const user = document.getElementById('username').value;
-            const resp = await fetch('/get-options?user=' + user);
-            const options = await resp.json();
-
-            options.publicKey.challenge = Uint8Array.from(atob(options.publicKey.challenge), c => c.charCodeAt(0));
-            options.publicKey.user.id = Uint8Array.from(atob(options.publicKey.user.id), c => c.charCodeAt(0));
-
-            log("Waiting for Feitian K40 touch...");
-            const cred = await navigator.credentials.create(options);
-
-            const response = await fetch('/complete-registration', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    id: cred.id,
-                    rawId: btoa(String.fromCharCode(...new Uint8Array(cred.rawId))),
-                    response: {
-                        attestationObject: btoa(String.fromCharCode(...new Uint8Array(cred.response.attestationObject))),
-                        clientDataJSON: btoa(String.fromCharCode(...new Uint8Array(cred.response.clientDataJSON)))
-                    },
-                    type: cred.type
-                })
-            });
-
-            const result = await response.json();
-            if (result.status === "OK") {
-                log("✅ Success! Key saved to SQLite.");
-            } else {
-                log("❌ Error: " + result.message);
-            }
-        }
-    </script>
-</body>
-</html>
-"""
+# --- Load HTML from external file ---
+try:
+    with open("register.html", "r", encoding="utf-8") as f:
+        HTML_TEMPLATE = f.read()
+except FileNotFoundError:
+    HTML_TEMPLATE = "<h1>Error: register.html not found</h1>"
 
 
 @app.route("/")
