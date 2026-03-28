@@ -9,10 +9,11 @@
 import base64
 import json
 import os
+import pickle  # To serialize the AttestedCredentialData object
+import sqlite3
 
 from fido2.features import webauthn_json_mapping
 from fido2.server import Fido2Server
-from fido2.utils import websafe_decode
 from fido2.webauthn import AuthenticatorAttestationResponse, RegistrationResponse
 from flask import Flask, render_template_string, request, session
 
@@ -25,18 +26,33 @@ app.secret_key = os.urandom(24)
 RP = {"id": "localhost", "name": "FidoLab Demo"}
 server = Fido2Server(RP)
 
-# In-memory "Database"
-credentials = []
+# --- SQLite Setup ---
+DB_FILE = "fido2_lab.db"
+
+
+def init_db():
+    with sqlite3.connect(DB_FILE) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS credentials (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL,
+                credential_id BLOB NOT NULL,
+                public_key BLOB NOT NULL
+            )
+        """)
+
+
+init_db()
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
 <html>
-<head><title>FIDO2/WebAuthn Demo</title></head>
+<head><title>FIDO2 Register</title></head>
 <body style="font-family: sans-serif; max-width: 600px; margin: 40px auto;">
-    <h2>Feitian K40 WebAuthn Demo</h2>
+    <h2>FidoLab: Registration</h2>
     <div>
         <input type="text" id="username" placeholder="Username" value="ramon_test">
-        <button onclick="register()">Register Key</button>
+        <button onclick="register()">Register Feitian Key</button>
     </div>
     <pre id="log" style="background: #eee; padding: 10px; margin-top: 20px;"></pre>
 
@@ -48,33 +64,31 @@ HTML_TEMPLATE = """
             const resp = await fetch('/get-options?user=' + user);
             const options = await resp.json();
 
-            // Prepare options for the browser API
             options.publicKey.challenge = Uint8Array.from(atob(options.publicKey.challenge), c => c.charCodeAt(0));
             options.publicKey.user.id = Uint8Array.from(atob(options.publicKey.user.id), c => c.charCodeAt(0));
 
-            log("Touching key for registration...");
-            try {
-                const cred = await navigator.credentials.create(options);
+            log("Waiting for Feitian K40 touch...");
+            const cred = await navigator.credentials.create(options);
 
-                // Helper to convert ArrayBuffer to Base64
-                const toBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+            const response = await fetch('/complete-registration', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    id: cred.id,
+                    rawId: btoa(String.fromCharCode(...new Uint8Array(cred.rawId))),
+                    response: {
+                        attestationObject: btoa(String.fromCharCode(...new Uint8Array(cred.response.attestationObject))),
+                        clientDataJSON: btoa(String.fromCharCode(...new Uint8Array(cred.response.clientDataJSON)))
+                    },
+                    type: cred.type
+                })
+            });
 
-                await fetch('/complete-registration', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({
-                        id: cred.id,
-                        rawId: toBase64(cred.rawId),
-                        response: {
-                            attestationObject: toBase64(cred.response.attestationObject),
-                            clientDataJSON: toBase64(cred.response.clientDataJSON)
-                        },
-                        type: cred.type
-                    })
-                });
-                log("Registration Successful and Verified!");
-            } catch (err) {
-                log("Error: " + err.message);
+            const result = await response.json();
+            if (result.status === "OK") {
+                log("✅ Success! Key saved to SQLite.");
+            } else {
+                log("❌ Error: " + result.message);
             }
         }
     </script>
@@ -91,15 +105,16 @@ def index():
 @app.route("/get-options")
 def get_options():
     username = request.args.get("user", "default_user")
+    session["username"] = username
     user_id = os.urandom(16)
 
+    # We start with an empty list because we allow multiple keys per user in a real app,
+    # but for this lab, we just need to generate the challenge.
     registration_data, state = server.register_begin(
-        {"id": user_id, "name": username, "displayName": username},
-        credentials,
+        {"id": user_id, "name": username, "displayName": username}, []
     )
     session["state"] = state
 
-    # Properly serialize the binary data for JSON
     return {
         "publicKey": {
             "rp": registration_data.public_key.rp,
@@ -122,38 +137,45 @@ def get_options():
 def complete_registration():
     data = request.json
     state = session.get("state")
+    username = session.get("username")
 
     try:
-        # These manual decodes ensure we have the correct 'bytes' type
-        credential_id = base64.b64decode(data["rawId"] + "===")
+        credential_id_raw = base64.b64decode(data["rawId"] + "===")
         attestation_obj = base64.b64decode(
             data["response"]["attestationObject"] + "==="
         )
         client_data_json = base64.b64decode(data["response"]["clientDataJSON"] + "===")
 
         reg_response = RegistrationResponse(
-            id=credential_id,
+            id=credential_id_raw,
             response=AuthenticatorAttestationResponse(
                 attestation_object=attestation_obj,
                 client_data=client_data_json,
             ),
-            authenticator_attachment=data.get("authenticatorAttachment"),
             type=data.get("type", "public-key"),
         )
 
         auth_data = server.register_complete(state, reg_response)
-        credentials.append(auth_data.credential_data)
 
-        print("✅ Successfully registered key!")
+        # --- Save to SQLite ---
+        # We pickle the credential_data object to save it easily as a BLOB
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute(
+                "INSERT INTO credentials (username, credential_id, public_key) VALUES (?, ?, ?)",
+                (
+                    username,
+                    auth_data.credential_data.credential_id,
+                    pickle.dumps(auth_data.credential_data),
+                ),
+            )
+
+        print(f"✅ Registered & Persisted key for {username}")
         return {"status": "OK"}
 
     except Exception as e:
         print(f"❌ Verification failed: {e}")
-        import traceback
-
-        traceback.print_exc()
         return {"status": "error", "message": str(e)}, 400
 
 
 if __name__ == "__main__":
-    app.run(host="localhost", port=5000)
+    app.run(port=5000)
