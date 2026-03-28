@@ -10,27 +10,23 @@ import base64
 import json
 import os
 
-from fido2.client import ClientData
-from fido2.hid import CtapHidDevice
+from fido2.features import webauthn_json_mapping
 from fido2.server import Fido2Server
-from fido2.webauthn import (
-    PublicKeyCredentialCreationOptions,
-    PublicKeyCredentialRequestOptions,
-)
+from fido2.utils import websafe_decode
+from fido2.webauthn import AuthenticatorAttestationResponse, RegistrationResponse
 from flask import Flask, render_template_string, request, session
+
+webauthn_json_mapping.enabled = True
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
 
-# --- Conceptual Configuration ---
-# RP = Relying Party (Your App)
-RP = {"id": "localhost", "name": "Feitian Demo App"}
+# RP (Relying Party) Configuration
+RP = {"id": "localhost", "name": "FidoLab Demo"}
 server = Fido2Server(RP)
 
 # In-memory "Database"
-# In a real app, you'd store 'credentials' in DuckDB or PostgreSQL
-users = {}  # username -> user_dict
-credentials = []  # List of registered credentials
+credentials = []
 
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -41,7 +37,6 @@ HTML_TEMPLATE = """
     <div>
         <input type="text" id="username" placeholder="Username" value="ramon_test">
         <button onclick="register()">Register Key</button>
-        <button onclick="login()">Authenticate</button>
     </div>
     <pre id="log" style="background: #eee; padding: 10px; margin-top: 20px;"></pre>
 
@@ -53,28 +48,34 @@ HTML_TEMPLATE = """
             const resp = await fetch('/get-options?user=' + user);
             const options = await resp.json();
 
-            // Convert base64 back to binary for the browser API
+            // Prepare options for the browser API
             options.publicKey.challenge = Uint8Array.from(atob(options.publicKey.challenge), c => c.charCodeAt(0));
             options.publicKey.user.id = Uint8Array.from(atob(options.publicKey.user.id), c => c.charCodeAt(0));
 
             log("Touching key for registration...");
-            const cred = await navigator.credentials.create(options);
+            try {
+                const cred = await navigator.credentials.create(options);
 
-            // Send the result back to the server
-            await fetch('/complete-registration', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    id: cred.id,
-                    rawId: btoa(String.fromCharCode(...new Uint8Array(cred.rawId))),
-                    response: {
-                        attestationObject: btoa(String.fromCharCode(...new Uint8Array(cred.response.attestationObject))),
-                        clientDataJSON: btoa(String.fromCharCode(...new Uint8Array(cred.response.clientDataJSON)))
-                    },
-                    type: cred.type
-                })
-            });
-            log("Registration Successful!");
+                // Helper to convert ArrayBuffer to Base64
+                const toBase64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+                await fetch('/complete-registration', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        id: cred.id,
+                        rawId: toBase64(cred.rawId),
+                        response: {
+                            attestationObject: toBase64(cred.response.attestationObject),
+                            clientDataJSON: toBase64(cred.response.clientDataJSON)
+                        },
+                        type: cred.type
+                    })
+                });
+                log("Registration Successful and Verified!");
+            } catch (err) {
+                log("Error: " + err.message);
+            }
         }
     </script>
 </body>
@@ -93,18 +94,12 @@ def get_options():
     user_id = os.urandom(16)
 
     registration_data, state = server.register_begin(
-        {
-            "id": user_id,
-            "name": username,
-            "displayName": username,
-        },
+        {"id": user_id, "name": username, "displayName": username},
         credentials,
     )
-
     session["state"] = state
 
-    # Manually build the JSON-compatible dictionary
-    # The browser's WebAuthn API expects specific fields to be base64 encoded
+    # Properly serialize the binary data for JSON
     return {
         "publicKey": {
             "rp": registration_data.public_key.rp,
@@ -128,16 +123,37 @@ def complete_registration():
     data = request.json
     state = session.get("state")
 
-    # Verify the registration with the fido2 server
-    auth_data = server.register_complete(state, data)
+    try:
+        # These manual decodes ensure we have the correct 'bytes' type
+        credential_id = base64.b64decode(data["rawId"] + "===")
+        attestation_obj = base64.b64decode(
+            data["response"]["attestationObject"] + "==="
+        )
+        client_data_json = base64.b64decode(data["response"]["clientDataJSON"] + "===")
 
-    # Store the credential in your 'database'
-    credentials.append(auth_data.credential_data)
+        reg_response = RegistrationResponse(
+            id=credential_id,
+            response=AuthenticatorAttestationResponse(
+                attestation_object=attestation_obj,
+                client_data=client_data_json,
+            ),
+            authenticator_attachment=data.get("authenticatorAttachment"),
+            type=data.get("type", "public-key"),
+        )
 
-    print(f"Successfully registered key for user!")
-    return {"status": "OK"}
+        auth_data = server.register_complete(state, reg_response)
+        credentials.append(auth_data.credential_data)
+
+        print("✅ Successfully registered key!")
+        return {"status": "OK"}
+
+    except Exception as e:
+        print(f"❌ Verification failed: {e}")
+        import traceback
+
+        traceback.print_exc()
+        return {"status": "error", "message": str(e)}, 400
 
 
 if __name__ == "__main__":
-    print("🚀 Starting Demo at http://localhost:5000")
-    app.run(port=5000)
+    app.run(host="localhost", port=5000)
