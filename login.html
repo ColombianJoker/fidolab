@@ -1,0 +1,131 @@
+<!doctype html>
+<html>
+    <head>
+        <title>FIDO2 Login</title>
+    </head>
+    <body style="font-family: sans-serif; max-width: 600px; margin: 40px auto">
+        <h2>FidoLab: Authentication</h2>
+        <div>
+            <input
+                type="text"
+                id="username"
+                placeholder="Username"
+                value="ramon_test"
+            />
+            <button onclick="login()">Login with Feitian Key</button>
+        </div>
+        <pre
+            id="log"
+            style="background: #eee; padding: 10px; margin-top: 20px"
+        ></pre>
+
+        <script>
+            const log = (m) =>
+                (document.getElementById("log").innerText += m + "\n");
+
+            /**
+             * Helper: Decodes Base64URL strings into Uint8Arrays.
+             */
+            const decode = (str) => {
+                // Safeguard: If str is undefined or null, return it as is
+                if (!str) return str;
+                const base64 = str.replace(/-/g, "+").replace(/_/g, "/");
+                const padded = base64.padEnd(
+                    base64.length + ((4 - (base64.length % 4)) % 4),
+                    "=",
+                );
+                return Uint8Array.from(atob(padded), (c) => c.charCodeAt(0));
+            };
+
+            // Fixed typo: changed 'aasync' to 'async'
+            async function login() {
+                const user = document.getElementById("username").value;
+                if (!user) {
+                    log("❌ Please enter a username first.");
+                    return;
+                }
+
+                log(`Fetching assertion options for ${user}...`);
+
+                try {
+                    const resp = await fetch(
+                        "/get-assertion-options?user=" + user,
+                    );
+                    const data = await resp.json();
+
+                    if (data.status === "error") {
+                        log("❌ " + data.message);
+                        return;
+                    }
+
+                    const publicKeyOptions = data.publicKey;
+
+                    // 1. Critical: Convert the challenge
+                    if (publicKeyOptions.challenge) {
+                        publicKeyOptions.challenge = decode(
+                            publicKeyOptions.challenge,
+                        );
+                    }
+
+                    // 2. Critical: Convert all allowed credential IDs safely
+                    if (publicKeyOptions.allowCredentials) {
+                        publicKeyOptions.allowCredentials.forEach((cred) => {
+                            // Check if id exists before trying to decode it
+                            if (cred.id) {
+                                cred.id = decode(cred.id);
+                            }
+                        });
+                    }
+
+                    // 3. User verification: Usually 'preferred' for Feitian K40 biometrics
+                    publicKeyOptions.userVerification = "preferred";
+
+                    log("Waiting for Feitian K40 touch/biometrics...");
+
+                    // Trigger the hardware
+                    const assertion = await navigator.credentials.get({
+                        publicKey: publicKeyOptions,
+                    });
+
+                    log("Assertion received, authenticating...");
+
+                    // 4. Helper for encoding bits back to Base64 for the wire
+                    const b64 = (buf) =>
+                        btoa(String.fromCharCode(...new Uint8Array(buf)));
+
+                    const response = await fetch("/complete-assertion", {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            id: assertion.id,
+                            rawId: b64(assertion.rawId),
+                            response: {
+                                authenticatorData: b64(
+                                    assertion.response.authenticatorData,
+                                ),
+                                clientDataJSON: b64(
+                                    assertion.response.clientDataJSON,
+                                ),
+                                signature: b64(assertion.response.signature),
+                                userHandle: assertion.response.userHandle
+                                    ? b64(assertion.response.userHandle)
+                                    : null,
+                            },
+                            type: assertion.type,
+                        }),
+                    });
+
+                    const result = await response.json();
+                    if (result.status === "OK") {
+                        log("✅ Login Successful!");
+                    } else {
+                        log("❌ Server Error: " + result.message);
+                    }
+                } catch (err) {
+                    log("❌ Browser Error: " + err.message);
+                    console.error(err);
+                }
+            }
+        </script>
+    </body>
+</html>
